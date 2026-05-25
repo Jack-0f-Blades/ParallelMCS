@@ -8,9 +8,13 @@
 #include <thread>
 #include <algorithm>
 #include <chrono>
-#include "CliqueColoringStrategy.h"
 
-static const double PROGRESS_LOG_INTERVAL = 2.0; // секунды
+static const double PROGRESS_LOG_INTERVAL = 2.0;
+static const int    NODE_CHECK_INTERVAL   = 10000;
+
+thread_local std::vector<std::vector<int>> ParallelMCS::t_stackP;
+thread_local std::vector<std::vector<int>> ParallelMCS::t_stackColors;
+thread_local std::vector<std::vector<int>> ParallelMCS::t_stackOrder;
 
 ParallelMCS::ParallelMCS(std::vector<std::vector<char>> const &vAdjacencyMatrix,
                          size_t queueCapacity,
@@ -31,7 +35,6 @@ ParallelMCS::ParallelMCS(std::vector<std::vector<char>> const &vAdjacencyMatrix,
     SetName("mcs-parallel");
     SetParallelMode(true);
     SetTaskQueue(&m_taskQueue);
-    this->m_maxSplitDepth = m_maxSplitDepth;
     LOG("ParallelMCS created: queueCapacity=" + std::to_string(m_queueCapacity) +
         " splitDepth=" + std::to_string(m_maxSplitDepth) +
         " targetQueueSize=" + std::to_string(m_targetQueueSize) +
@@ -58,13 +61,12 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
         initialClique = R;
     }
 
-    // Инициализация порядка и раскраски
     std::vector<int> P;
     std::vector<int> vVertexOrder;
     std::vector<int> vColors;
     InitializeOrder(P, vVertexOrder, vColors);
     if (checkTimeout()) { m_taskQueue.Stop(); return m_uMaximumCliqueSize; }
-    Color(vVertexOrder, P, vColors);
+    // Убрана лишняя раскраска:
     vVertexOrder = P;
 
     {
@@ -80,7 +82,6 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
 
     LOG("Initial best bound = " + std::to_string(m_uMaximumCliqueSize.load()));
 
-    // Генерация начальных задач
     std::vector<int> currentP = P;
     std::vector<int> currentOrder = vVertexOrder;
     std::vector<int> currentColors = vColors;
@@ -117,20 +118,16 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
     }
     LOG("Initial tasks generated: " + std::to_string(generatedCount) + ", queue size=" + std::to_string(m_taskQueue.size_approx()));
 
-    // Запуск воркеров
     ParallelRunner runner(this, &m_taskQueue);
     int threads = m_numThreads > 0 ? m_numThreads : 1;
     runner.Start(threads, cliques);
 
-    // Основной поток тоже обрабатывает оставшиеся начальные вершины и следит за очередью
     long localNodeCount = 0;
     int localDepth = 0;
     std::vector<int> localR2;
-    // Выполняем оставшиеся начальные вершины (если есть)
     while (!currentP.empty() || m_taskQueue.pending_tasks() > 0) {
         if (checkTimeout()) break;
 
-        // Если очередь мала, добавляем новые задачи из оставшихся начальных вершин
         if (!currentP.empty() && m_taskQueue.size_approx() < m_queueLowThreshold) {
             int v = currentP.back();
             currentP.pop_back();
@@ -161,11 +158,10 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
         auto taskOpt = m_taskQueue.try_pop();
         if (taskOpt.has_value()) {
             LOG("Main thread popped task, pending=" + std::to_string(m_taskQueue.pending_tasks()));
-            // Обрабатываем задачу в основном потоке
-            std::vector<int> Ptask = taskOpt->P;
-            std::vector<int> orderTask = taskOpt->order;
-            std::vector<int> colorsTask = taskOpt->colors;
-            std::vector<int> Rtask = taskOpt->clique;
+            std::vector<int> Ptask = std::move(taskOpt->P);
+            std::vector<int> orderTask = std::move(taskOpt->order);
+            std::vector<int> colorsTask = std::move(taskOpt->colors);
+            std::vector<int> Rtask = std::move(taskOpt->clique);
             int depthTask = taskOpt->depth;
             RunRecursiveParallel(Ptask, orderTask, cliques, colorsTask, Rtask, depthTask, localNodeCount);
             m_taskQueue.taskDone();
@@ -209,10 +205,21 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
                                        int &depth,
                                        long &nodeCount)
 {
+    if (t_stackP.empty()) {
+        size_t n = m_AdjacencyMatrix.size();
+        t_stackP.resize(n + 1);
+        t_stackColors.resize(n + 1);
+        t_stackOrder.resize(n + 1);
+        for (size_t i = 0; i <= n; ++i) {
+            t_stackP[i].reserve(n);
+            t_stackColors[i].reserve(n);
+            t_stackOrder[i].reserve(n);
+        }
+    }
+
     CliqueColoringStrategy localColoring(m_AdjacencyMatrix);
     localColoring.SetStopFlag(&m_bTimedOut);
 
-    // Для периодического лога внутри задачи (по времени)
     auto taskStartTime = std::chrono::steady_clock::now();
     auto lastLogTime = taskStartTime;
 
@@ -220,16 +227,23 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
         if (m_bTimedOut.load(std::memory_order_acquire)) return;
         ++nodeCount;
 
-        // Периодический лог прогресса (каждые 2 секунды) – только для демонстрации активности
-        auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - taskStartTime).count();
-        if (elapsed - std::chrono::duration<double>(now - lastLogTime).count() >= PROGRESS_LOG_INTERVAL) {
-            lastLogTime = now;
-            LOG("Worker progress: nodes=" + std::to_string(nodeCount) +
-                " depth=" + std::to_string(depth) +
-                " Rsize=" + std::to_string(R.size()) +
-                " Psize=" + std::to_string(P.size()) +
-                " bound=" + std::to_string(vColors.back()));
+        if ((nodeCount % NODE_CHECK_INTERVAL) == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - taskStartTime).count();
+            double lastLogElapsed = std::chrono::duration<double>(lastLogTime - taskStartTime).count();
+            if (elapsed - lastLogElapsed >= PROGRESS_LOG_INTERVAL) {
+                lastLogTime = now;
+                LOG("Worker progress: nodes=" + std::to_string(nodeCount) +
+                    " depth=" + std::to_string(depth) +
+                    " Rsize=" + std::to_string(R.size()) +
+                    " Psize=" + std::to_string(P.size()) +
+                    " bound=" + std::to_string(vColors.back()));
+            }
+            double globalElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_StartTimePoint).count();
+            if (m_TimeOutSeconds > 0 && globalElapsed > m_TimeOutSeconds) {
+                m_bTimedOut.store(true, std::memory_order_release);
+                return;
+            }
         }
 
         int bound = vColors.back();
@@ -243,17 +257,20 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
         int v = P.back();
         P.pop_back();
 
-        std::vector<int> newOrder;
+        std::vector<int> &newOrder = t_stackOrder[R.size() + 1];
         GetNewOrderLocal(newOrder, vVertexOrder, P, v, R);
 
         if (!newOrder.empty()) {
-            std::vector<int> newP(newOrder.size());
-            std::vector<int> newColors(newOrder.size());
+            std::vector<int> &newP = t_stackP[R.size() + 1];
+            std::vector<int> &newColors = t_stackColors[R.size() + 1];
+            newP.resize(newOrder.size());
+            newColors.resize(newOrder.size());
             localColoring.Recolor(m_AdjacencyMatrix, newOrder, newP, newColors,
                                   static_cast<int>(currentBest),
                                   static_cast<int>(R.size()));
 
             size_t newBound = newColors.empty() ? 0 : newColors.back();
+            // PREPRUNE уже выполнен (проверка перед созданием задачи или рекурсией)
             if (R.size() + newBound <= currentBest) {
                 ProcessOrderAfterRecursionLocal(vVertexOrder, P, vColors, v, R);
                 continue;
@@ -296,8 +313,9 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
                     std::lock_guard<std::mutex> lock(m_bestMutex);
                     if (!cliques.empty())
                         cliques.back() = std::list<int>(R.begin(), R.end());
+                    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_StartTimePoint).count();
                     LOG("New best clique found, size=" + std::to_string(newSize) +
-                        " time=" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - m_StartTimePoint).count()) + "s");
+                        " time=" + std::to_string(elapsed) + "s");
                     break;
                 }
                 newSize = R.size();

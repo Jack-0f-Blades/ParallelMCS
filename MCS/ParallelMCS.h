@@ -1,7 +1,3 @@
-/*Параллельная версия MCS. Содержит кольцевую очередь задач (TaskQueue), пул воркеров (ParallelRunner), 
-логику динамического создания подзадач на основе глубины и размера очереди. 
-Метод RunRecursiveParallel — рекурсивный обход с локальной копией раскраски.*/
-
 #ifndef PARALLEL_MCS_H
 #define PARALLEL_MCS_H
 
@@ -10,6 +6,7 @@
 #include <list>
 #include <atomic>
 #include <chrono>
+#include <vector>
 
 class ParallelMCS : public MCS
 {
@@ -49,8 +46,12 @@ private:
     int    m_nodesBetweenChecks;
     int    m_minTaskSize;
 
-    // Для возможного логирования прогресса в Run (опционально)
     std::chrono::steady_clock::time_point m_lastLogTime;
+
+    // Thread‑local стеки для переиспользования памяти внутри каждого потока
+    static thread_local std::vector<std::vector<int>> t_stackP;
+    static thread_local std::vector<std::vector<int>> t_stackColors;
+    static thread_local std::vector<std::vector<int>> t_stackOrder;
 };
 
-#endif
+#endif // PARALLEL_MCS_H

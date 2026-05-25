@@ -7,7 +7,8 @@
 
 using namespace std;
 
-static const double LOG_INTERVAL_SEC = 2.0;   // печатать прогресс каждые 2 секунды
+static const double LOG_INTERVAL_SEC = 2.0;
+static const int NODE_CHECK_INTERVAL = 10000;
 
 MaxSubgraphAlgorithm::MaxSubgraphAlgorithm(string const &name)
     : Algorithm(name),
@@ -54,11 +55,11 @@ void MaxSubgraphAlgorithm::ProcessOrderBeforeReturn(vector<int> &vVertexOrder,
 
 void MaxSubgraphAlgorithm::SetInitialClique(const vector<int>& clique)
 {
-    lock_guard<mutex> lock(m_bestMutex);
-    R = clique;
-    m_uMaximumCliqueSize = clique.size();
-    if (!clique.empty())
+    if (clique.size() > m_uMaximumCliqueSize.load(memory_order_acquire)) {
+        m_uMaximumCliqueSize.store(clique.size(), memory_order_release);
+        R = clique;
         LOG("Initial clique from ILS, size=" + to_string(clique.size()));
+    }
 }
 
 void MaxSubgraphAlgorithm::SetTimeOut(double seconds)
@@ -68,7 +69,7 @@ void MaxSubgraphAlgorithm::SetTimeOut(double seconds)
 
 bool MaxSubgraphAlgorithm::IsTimedOut() const
 {
-    return m_bTimedOut;
+    return m_bTimedOut.load(memory_order_acquire);
 }
 
 void MaxSubgraphAlgorithm::SetParallelMode(bool enable)
@@ -89,31 +90,24 @@ void MaxSubgraphAlgorithm::SetTaskQueue(TaskQueue* queue)
 long MaxSubgraphAlgorithm::Run(list<list<int>> &cliques)
 {
     LOG("=== Starting MCS ===");
-    vector<int> initialClique;
-    {
-        lock_guard<mutex> lock(m_bestMutex);
-        initialClique = R;
-    }
+    vector<int> initialClique = R; // копия
 
     vector<int> &P = stackP[0];
     vector<int> &vColors = stackColors[0];
     vector<int> &vVertexOrder = stackOrder[0];
 
     InitializeOrder(P, vVertexOrder, vColors);
-    Color(vVertexOrder, P, vColors);
+    // Убрана лишняя раскраска:
     vVertexOrder = P;
 
-    {
-        lock_guard<mutex> lock(m_bestMutex);
-        if (!initialClique.empty() && initialClique.size() > m_uMaximumCliqueSize) {
-            m_uMaximumCliqueSize = initialClique.size();
-            if (!cliques.empty()) {
-                cliques.back() = list<int>(initialClique.begin(), initialClique.end());
-            }
-            LOG("Adopted ILS clique as starting best, size=" + to_string(initialClique.size()));
+    if (!initialClique.empty() && initialClique.size() > m_uMaximumCliqueSize.load(memory_order_acquire)) {
+        m_uMaximumCliqueSize.store(initialClique.size(), memory_order_release);
+        if (!cliques.empty()) {
+            cliques.back() = list<int>(initialClique.begin(), initialClique.end());
         }
-        R.clear();
+        LOG("Adopted ILS clique as starting best, size=" + to_string(initialClique.size()));
     }
+    R.clear();
 
     nodeCount = 0;
     depth = 0;
@@ -128,7 +122,7 @@ long MaxSubgraphAlgorithm::Run(list<list<int>> &cliques)
         ", nodes=" + to_string(nodeCount) +
         ", time=" + to_string(totalTime) + "s" +
         ", repairs=" + to_string(getRepairCount()));
-    return m_uMaximumCliqueSize;
+    return m_uMaximumCliqueSize.load();
 }
 
 void MaxSubgraphAlgorithm::RunRecursive(vector<int> &P,
@@ -138,71 +132,84 @@ void MaxSubgraphAlgorithm::RunRecursive(vector<int> &P,
 {
     while (!P.empty())
     {
-        nodeCount++;
+        ++nodeCount;
 
-        // Вычисляем прошедшее время и проверяем, пора ли логгировать прогресс
-        auto now = chrono::steady_clock::now();
-        double elapsed = chrono::duration<double>(now - m_StartTimePoint).count();
-        double lastLogElapsed = chrono::duration<double>(m_LastLogTime - m_StartTimePoint).count();
+        if ((nodeCount % NODE_CHECK_INTERVAL) == 0) {
+            auto now = chrono::steady_clock::now();
+            double elapsed = chrono::duration<double>(now - m_StartTimePoint).count();
+            double lastLogElapsed = chrono::duration<double>(m_LastLogTime - m_StartTimePoint).count();
 
-        if (elapsed - lastLogElapsed >= LOG_INTERVAL_SEC) {
-            m_LastLogTime = now;
-            LOG("Progress: nodes=" + to_string(nodeCount) +
-                " time=" + to_string(elapsed) + "s" +
-                " best=" + to_string(m_uMaximumCliqueSize.load()) +
-                " depth=" + to_string(depth) +
-                " Rsize=" + to_string(R.size()) +
-                " Psize=" + to_string(P.size()) +
-                " bound=" + to_string(vColors.back()));
-        }
+            if (elapsed - lastLogElapsed >= LOG_INTERVAL_SEC) {
+                m_LastLogTime = now;
+                LOG("Progress: nodes=" + to_string(nodeCount) +
+                    " time=" + to_string(elapsed) + "s" +
+                    " best=" + to_string(m_uMaximumCliqueSize.load()) +
+                    " depth=" + to_string(depth) +
+                    " Rsize=" + to_string(R.size()) +
+                    " Psize=" + to_string(P.size()) +
+                    " bound=" + to_string(vColors.back()));
+            }
 
-        if (m_TimeOutSeconds > 0 && elapsed > m_TimeOutSeconds) {
-            m_bTimedOut = true;
-            LOG("Timeout occurred");
-            return;
+            if (m_TimeOutSeconds > 0 && elapsed > m_TimeOutSeconds) {
+                m_bTimedOut.store(true, memory_order_release);
+                LOG("Timeout occurred");
+                return;
+            }
         }
 
         int bound = vColors.back();
-        {
-            lock_guard<mutex> lock(m_bestMutex);
-            if ((int)R.size() + bound <= (int)m_uMaximumCliqueSize)
-            {
-                P.clear();
-                return;
-            }
+        if (R.size() + bound <= m_uMaximumCliqueSize.load(memory_order_relaxed)) {
+            P.clear();
+            return;
         }
 
         vColors.pop_back();
         int v = P.back();
         P.pop_back();
 
-        vector<int> newOrder;
+        vector<int> &newOrder = stackOrder[R.size() + 1];
         GetNewOrder(newOrder, vVertexOrder, P, v);
 
         if (!newOrder.empty())
         {
-            vector<int> newP(newOrder.size());
-            vector<int> newColors(newOrder.size());
+            vector<int> &newP = stackP[R.size() + 1];
+            vector<int> &newColors = stackColors[R.size() + 1];
+            newP.resize(newOrder.size());
+            newColors.resize(newOrder.size());
             Color(newOrder, newP, newColors);
 
-            depth++;
-            RunRecursive(newP, newOrder, cliques, newColors);
-            depth--;
+            // PREPRUNE: проверка перед рекурсией
+            if (R.size() + newColors.back() > m_uMaximumCliqueSize.load(memory_order_relaxed)) {
+                ++depth;
+                RunRecursive(newP, newOrder, cliques, newColors);
+                --depth;
+            }
         }
         else
         {
-            lock_guard<mutex> lock(m_bestMutex);
-            if ((int)R.size() > (int)m_uMaximumCliqueSize)
-            {
-                m_uMaximumCliqueSize = R.size();
-                cliques.back() = list<int>(R.begin(), R.end());
-                LOG("New best clique found, size=" + to_string(R.size()) +
-                    " time=" + to_string(elapsed) + "s");
+            // Найдена новая клика
+            size_t newSize = R.size();
+            size_t oldBest = m_uMaximumCliqueSize.load(memory_order_acquire);
+            while (newSize > oldBest) {
+                if (m_uMaximumCliqueSize.compare_exchange_weak(oldBest, newSize,
+                                                              memory_order_release,
+                                                              memory_order_acquire)) {
+                    // обновляем список клик (не требуется блокировка, т.к. однопоточный режим)
+                    if (!cliques.empty())
+                        cliques.back() = list<int>(R.begin(), R.end());
+                    double elapsed = chrono::duration<double>(chrono::steady_clock::now() - m_StartTimePoint).count();
+                    LOG("New best clique found, size=" + to_string(R.size()) +
+                        " time=" + to_string(elapsed) + "s");
+                    break;
+                }
+                newSize = R.size();
             }
         }
 
         ProcessOrderAfterRecursion(vVertexOrder, P, vColors, v);
     }
+
+    ProcessOrderBeforeReturn(vVertexOrder, P, vColors);
     P.clear();
 }
 
@@ -213,11 +220,7 @@ void MaxSubgraphAlgorithm::RunFromTask(const Task& t,
     vector<int> vVertexOrder = t.order;
     vector<int> vColors = t.colors;
 
-    {
-        lock_guard<mutex> lock(m_bestMutex);
-        R = t.clique;
-    }
-
+    R = t.clique;
     depth = t.depth;
     RunRecursive(P, vVertexOrder, cliques, vColors);
 }
