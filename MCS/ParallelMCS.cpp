@@ -8,6 +8,7 @@
 #include <thread>
 #include <algorithm>
 #include <chrono>
+#include <set>
 
 static const double PROGRESS_LOG_INTERVAL = 2.0;
 static const int    NODE_CHECK_INTERVAL   = 10000;
@@ -46,6 +47,39 @@ ParallelMCS::~ParallelMCS()
     m_taskQueue.Stop();
 }
 
+void ParallelMCS::updateBestClique(const std::vector<int>& clique)
+{
+    std::lock_guard<std::mutex> lock(m_bestCliqueMutex);
+    if (clique.size() > m_bestClique.size()) {
+        m_bestClique = clique;
+    }
+}
+
+std::vector<int> ParallelMCS::GetBestClique() const
+{
+    std::lock_guard<std::mutex> lock(m_bestCliqueMutex);
+    return m_bestClique;
+}
+
+// Восстановить клику размера targetSize из упорядоченного списка вершин (жадный алгоритм)
+static std::vector<int> extractCliqueFromOrder(const std::vector<std::vector<char>>& adj,
+                                               const std::vector<int>& order,
+                                               size_t targetSize)
+{
+    std::vector<int> clique;
+    for (int v : order) {
+        bool ok = true;
+        for (int u : clique) {
+            if (!adj[v][u]) { ok = false; break; }
+        }
+        if (ok) {
+            clique.push_back(v);
+            if (clique.size() == targetSize) break;
+        }
+    }
+    return clique;
+}
+
 long ParallelMCS::Run(std::list<std::list<int>> &cliques)
 {
     LOG("=== Starting Parallel MCS ===");
@@ -55,10 +89,14 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
 
     coloringStrategy.SetStopFlag(&m_bTimedOut);
 
-    std::vector<int> initialClique;
+    // Сохраняем начальную клику из ILS (если была установлена через SetInitialClique)
+    std::vector<int> initialCliqueILS;
     {
         std::lock_guard<std::mutex> lock(m_bestMutex);
-        initialClique = R;
+        initialCliqueILS = R;
+        if (!initialCliqueILS.empty()) {
+            updateBestClique(initialCliqueILS);
+        }
     }
 
     std::vector<int> P;
@@ -66,22 +104,48 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
     std::vector<int> vColors;
     InitializeOrder(P, vVertexOrder, vColors);
     if (checkTimeout()) { m_taskQueue.Stop(); return m_uMaximumCliqueSize; }
-    // Убрана лишняя раскраска:
     vVertexOrder = P;
 
+    // ---- 1. Используем клику, найденную MCR (m_initialClique) ----
+    if (!m_initialClique.empty() && m_initialClique.size() > m_uMaximumCliqueSize.load(std::memory_order_acquire)) {
+        m_uMaximumCliqueSize.store(m_initialClique.size(), std::memory_order_release);
+        updateBestClique(m_initialClique);
+        if (!cliques.empty() && cliques.back().empty()) {
+            cliques.back() = std::list<int>(m_initialClique.begin(), m_initialClique.end());
+        }
+        LOG("Adopted MCR initial clique, size=" + std::to_string(m_initialClique.size()));
+    }
+    // ---- 2. Если MCR не вернул клику, но размер известен - восстанавливаем из порядка ----
+    else if (m_uMaximumCliqueSize.load() > 0 && cliques.back().empty()) {
+        size_t bestSize = m_uMaximumCliqueSize.load();
+        std::vector<int> recovered = extractCliqueFromOrder(m_AdjacencyMatrix, vVertexOrder, bestSize);
+        if (recovered.size() == bestSize) {
+            updateBestClique(recovered);
+            if (!cliques.empty() && cliques.back().empty()) {
+                cliques.back() = std::list<int>(recovered.begin(), recovered.end());
+            }
+            LOG("Recovered clique of size " + std::to_string(bestSize) + " from vertex order");
+        } else {
+            LOG("Failed to recover clique, bestSize=" + std::to_string(bestSize));
+        }
+    }
+
+    // ---- 3. Применяем ILS клику (если она больше) ----
     {
         std::lock_guard<std::mutex> lock(m_bestMutex);
-        if (!initialClique.empty() && initialClique.size() > m_uMaximumCliqueSize.load(std::memory_order_acquire)) {
-            m_uMaximumCliqueSize.store(initialClique.size(), std::memory_order_release);
+        if (!initialCliqueILS.empty() && initialCliqueILS.size() > m_uMaximumCliqueSize.load(std::memory_order_acquire)) {
+            m_uMaximumCliqueSize.store(initialCliqueILS.size(), std::memory_order_release);
             if (!cliques.empty())
-                cliques.back() = std::list<int>(initialClique.begin(), initialClique.end());
-            LOG("Adopted ILS clique as starting best, size=" + std::to_string(initialClique.size()));
+                cliques.back() = std::list<int>(initialCliqueILS.begin(), initialCliqueILS.end());
+            updateBestClique(initialCliqueILS);
+            LOG("Adopted ILS clique as starting best, size=" + std::to_string(initialCliqueILS.size()));
         }
         R.clear();
     }
 
     LOG("Initial best bound = " + std::to_string(m_uMaximumCliqueSize.load()));
 
+    // Генерация начальных задач
     std::vector<int> currentP = P;
     std::vector<int> currentOrder = vVertexOrder;
     std::vector<int> currentColors = vColors;
@@ -118,10 +182,12 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
     }
     LOG("Initial tasks generated: " + std::to_string(generatedCount) + ", queue size=" + std::to_string(m_taskQueue.size_approx()));
 
+    // Запуск воркеров
     ParallelRunner runner(this, &m_taskQueue);
     int threads = m_numThreads > 0 ? m_numThreads : 1;
     runner.Start(threads, cliques);
 
+    // Основной поток обрабатывает оставшиеся задачи
     long localNodeCount = 0;
     int localDepth = 0;
     std::vector<int> localR2;
@@ -174,6 +240,16 @@ long ParallelMCS::Run(std::list<std::list<int>> &cliques)
 
     m_taskQueue.Stop();
     runner.Wait();
+
+    // Гарантированно записываем лучшую клику в выходной список
+    {
+        std::lock_guard<std::mutex> lock(m_bestCliqueMutex);
+        if (!cliques.empty() && cliques.back().empty() && !m_bestClique.empty()) {
+            cliques.back() = std::list<int>(m_bestClique.begin(), m_bestClique.end());
+            LOG("Final clique written from m_bestClique, size=" + std::to_string(m_bestClique.size()));
+        }
+    }
+
     double totalTime = std::chrono::duration<double>(std::chrono::steady_clock::now() - m_StartTimePoint).count();
     LOG("=== Finished Parallel MCS, max clique size=" + std::to_string(m_uMaximumCliqueSize.load()) +
         ", time=" + std::to_string(totalTime) + "s" +
@@ -265,12 +341,14 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
             std::vector<int> &newColors = t_stackColors[R.size() + 1];
             newP.resize(newOrder.size());
             newColors.resize(newOrder.size());
+
+            int delta = static_cast<int>(currentBest) - static_cast<int>(R.size());
+            if (delta < 0) delta = 0;
             localColoring.Recolor(m_AdjacencyMatrix, newOrder, newP, newColors,
                                   static_cast<int>(currentBest),
                                   static_cast<int>(R.size()));
 
             size_t newBound = newColors.empty() ? 0 : newColors.back();
-            // PREPRUNE уже выполнен (проверка перед созданием задачи или рекурсией)
             if (R.size() + newBound <= currentBest) {
                 ProcessOrderAfterRecursionLocal(vVertexOrder, P, vColors, v, R);
                 continue;
@@ -304,12 +382,14 @@ void ParallelMCS::RunRecursiveParallel(std::vector<int> &P,
             RunRecursiveParallel(newP, newOrder, cliques, newColors, R, depth, nodeCount);
             --depth;
         } else {
+            // Найдена новая максимальная клика
             size_t newSize = R.size();
             size_t oldBest = m_uMaximumCliqueSize.load(std::memory_order_acquire);
             while (newSize > oldBest) {
                 if (m_uMaximumCliqueSize.compare_exchange_weak(oldBest, newSize,
                                                               std::memory_order_release,
                                                               std::memory_order_acquire)) {
+                    updateBestClique(R);
                     std::lock_guard<std::mutex> lock(m_bestMutex);
                     if (!cliques.empty())
                         cliques.back() = std::list<int>(R.begin(), R.end());

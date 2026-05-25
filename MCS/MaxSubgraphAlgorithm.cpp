@@ -55,6 +55,7 @@ void MaxSubgraphAlgorithm::ProcessOrderBeforeReturn(vector<int> &vVertexOrder,
 
 void MaxSubgraphAlgorithm::SetInitialClique(const vector<int>& clique)
 {
+    m_initialClique = clique;
     if (clique.size() > m_uMaximumCliqueSize.load(memory_order_acquire)) {
         m_uMaximumCliqueSize.store(clique.size(), memory_order_release);
         R = clique;
@@ -97,7 +98,6 @@ long MaxSubgraphAlgorithm::Run(list<list<int>> &cliques)
     vector<int> &vVertexOrder = stackOrder[0];
 
     InitializeOrder(P, vVertexOrder, vColors);
-    // Убрана лишняя раскраска:
     vVertexOrder = P;
 
     if (!initialClique.empty() && initialClique.size() > m_uMaximumCliqueSize.load(memory_order_acquire)) {
@@ -178,7 +178,6 @@ void MaxSubgraphAlgorithm::RunRecursive(vector<int> &P,
             newColors.resize(newOrder.size());
             Color(newOrder, newP, newColors);
 
-            // PREPRUNE: проверка перед рекурсией
             if (R.size() + newColors.back() > m_uMaximumCliqueSize.load(memory_order_relaxed)) {
                 ++depth;
                 RunRecursive(newP, newOrder, cliques, newColors);
@@ -194,7 +193,6 @@ void MaxSubgraphAlgorithm::RunRecursive(vector<int> &P,
                 if (m_uMaximumCliqueSize.compare_exchange_weak(oldBest, newSize,
                                                               memory_order_release,
                                                               memory_order_acquire)) {
-                    // обновляем список клик (не требуется блокировка, т.к. однопоточный режим)
                     if (!cliques.empty())
                         cliques.back() = list<int>(R.begin(), R.end());
                     double elapsed = chrono::duration<double>(chrono::steady_clock::now() - m_StartTimePoint).count();
@@ -206,7 +204,26 @@ void MaxSubgraphAlgorithm::RunRecursive(vector<int> &P,
             }
         }
 
+        bool bPIsEmpty = P.empty();
         ProcessOrderAfterRecursion(vVertexOrder, P, vColors, v);
+
+        if (!bPIsEmpty && P.empty()) {
+            size_t newSize = R.size();
+            size_t oldBest = m_uMaximumCliqueSize.load(memory_order_acquire);
+            while (newSize > oldBest) {
+                if (m_uMaximumCliqueSize.compare_exchange_weak(oldBest, newSize,
+                                                              memory_order_release,
+                                                              memory_order_acquire)) {
+                    if (!cliques.empty())
+                        cliques.back() = list<int>(R.begin(), R.end());
+                    double elapsed = chrono::duration<double>(chrono::steady_clock::now() - m_StartTimePoint).count();
+                    LOG("New best clique found (post-recursion), size=" + to_string(R.size()) +
+                        " time=" + to_string(elapsed) + "s");
+                    break;
+                }
+                newSize = R.size();
+            }
+        }
     }
 
     ProcessOrderBeforeReturn(vVertexOrder, P, vColors);

@@ -68,10 +68,17 @@ void CliqueColoringStrategy::Recolor(vector<vector<char>> const &adjacencyMatrix
                                      int const currentBestCliqueSize,
                                      int const currentCliqueSize)
 {
+    // Защита от отрицательной дельты (из-за гонок)
+    int iBestCliqueDelta = currentBestCliqueSize - currentCliqueSize;
+    if (iBestCliqueDelta <= 0) {
+        // Нет смысла выполнять перекраску – используем обычную раскраску
+        Color(adjacencyMatrix, vVertexOrder, vVerticesToReorder, vColors);
+        return;
+    }
+
     if (vVertexOrder.empty()) return;
 
     size_t maxColor = 0;
-    int iBestCliqueDelta = currentBestCliqueSize - currentCliqueSize;
 
     for (int const vertex : vVertexOrder)
     {
@@ -95,11 +102,15 @@ void CliqueColoringStrategy::Recolor(vector<vector<char>> const &adjacencyMatrix
             color++;
         }
 
+        // Проверка границ
+        if (color >= m_vvVerticesWithColor.size()) {
+            // Расширяем, если необходимо (хотя по логике не должно случиться)
+            m_vvVerticesWithColor.resize(color + 1);
+        }
         m_vvVerticesWithColor[color].push_back(vertex);
         maxColor = max(maxColor, color);
 
-        if (color + 1 > static_cast<size_t>(iBestCliqueDelta) && color == maxColor)
-        {
+        if (color + 1 > static_cast<size_t>(iBestCliqueDelta) && color == maxColor) {
             Repair(vertex, static_cast<int>(color), iBestCliqueDelta);
             if (m_vvVerticesWithColor[maxColor].empty())
                 maxColor--;
@@ -142,7 +153,6 @@ int CliqueColoringStrategy::GetConflictingVertex(int const vertex, vector<int> c
     return conflicting;
 }
 
-// ИСПРАВЛЕННЫЙ Repair: удалён ошибочный return false после внутреннего цикла
 bool CliqueColoringStrategy::Repair(int const vertex, int const color, int const iBestCliqueDelta)
 {
     for (int newColor = 0; newColor <= iBestCliqueDelta - 1; newColor++)
@@ -167,7 +177,6 @@ bool CliqueColoringStrategy::Repair(int const vertex, int const color, int const
             ++m_repairCount;
             return true;
         }
-        // НЕТ return false здесь – продолжаем перебирать newColor
     }
     return false;
 }

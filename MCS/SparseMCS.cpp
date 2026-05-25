@@ -1,13 +1,13 @@
 #include "SparseMCS.h"
 #include "OrderingTools.h"
-#include <iostream>
+#include <algorithm>
 
 using namespace std;
 
 SparseMCS::SparseMCS(vector<vector<int>> const &adjacencyArray)
     : MaxSubgraphAlgorithm("sparse-mcs"),
       m_AdjacencyArray(adjacencyArray),
-      coloringStrategy(m_AdjacencyArray)
+      coloringStrategy(adjacencyArray)
 {
     coloringStrategy.SetStopFlag(&m_bTimedOut);
 
@@ -25,18 +25,15 @@ SparseMCS::SparseMCS(vector<vector<int>> const &adjacencyArray)
 void SparseMCS::InitializeOrder(vector<int> &P, vector<int> &vVertexOrder, vector<int> &vColors)
 {
     size_t dummyCliqueSize = 0;
-    InitialOrderingMCR(m_AdjacencyArray, P, vColors, dummyCliqueSize, &m_bTimedOut);
+    vector<int> dummyCliqueVertices; // временный вектор для outClique
+    OrderingTools::InitialOrderingMCR(m_AdjacencyArray, P, vColors, dummyCliqueSize, dummyCliqueVertices, &m_bTimedOut);
     m_uMaximumCliqueSize = dummyCliqueSize;
     vVertexOrder = P;
 }
 
-void SparseMCS::Color(vector<int> const &vVertexOrder,
-                      vector<int> &vVerticesToReorder,
-                      vector<int> &vColors)
+void SparseMCS::Color(vector<int> const &vVertexOrder, vector<int> &vVerticesToReorder, vector<int> &vColors)
 {
-    coloringStrategy.Recolor(m_AdjacencyArray, vVertexOrder, vVerticesToReorder, vColors,
-                             static_cast<int>(m_uMaximumCliqueSize.load()),
-                             static_cast<int>(R.size()));
+    coloringStrategy.Color(m_AdjacencyArray, vVertexOrder, vVerticesToReorder, vColors);
 }
 
 void SparseMCS::GetNewOrderLocal(vector<int> &vNewVertexOrder,
@@ -47,12 +44,11 @@ void SparseMCS::GetNewOrderLocal(vector<int> &vNewVertexOrder,
 {
     if (chosenVertex != -1) R_local.push_back(chosenVertex);
     vNewVertexOrder.clear();
-    // Временный булевый массив для соседей chosenVertex
-    vector<bool> isNeighbor(m_AdjacencyArray.size(), false);
-    for (int nb : m_AdjacencyArray[chosenVertex]) isNeighbor[nb] = true;
-    for (int candidate : vVertexOrder) {
-        if (candidate != chosenVertex && isNeighbor[candidate])
-            vNewVertexOrder.push_back(candidate);
+    const auto &neighbors = m_AdjacencyArray[chosenVertex];
+    for (int const vertex : vVertexOrder) {
+        if (vertex != chosenVertex && binary_search(neighbors.begin(), neighbors.end(), vertex)) {
+            vNewVertexOrder.push_back(vertex);
+        }
     }
 }
 
@@ -62,7 +58,11 @@ void SparseMCS::ProcessOrderAfterRecursionLocal(vector<int> &vVertexOrder,
                                                 int const chosenVertex,
                                                 vector<int> &R_local)
 {
-    if (chosenVertex != -1) R_local.pop_back();
+    if (chosenVertex == -1) return;
+    auto it = find(vVertexOrder.begin(), vVertexOrder.end(), chosenVertex);
+    if (it != vVertexOrder.end())
+        vVertexOrder.erase(it);
+    R_local.pop_back();
 }
 
 void SparseMCS::ProcessOrderBeforeReturnLocal(vector<int> &vVertexOrder,

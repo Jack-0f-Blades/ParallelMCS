@@ -65,7 +65,6 @@ int main(int argc, char* argv[]) {
     int numThreads = thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
 
-    // Параметры параллельного MCS
     size_t queueCapacity = 0;
     int splitDepth = 2;
     size_t targetQueueSize = 100;
@@ -73,7 +72,6 @@ int main(int argc, char* argv[]) {
     int nodesBetweenChecks = 500;
     int minTaskSize = 10;
 
-    // Параметры ILS
     int ilsScans = 1000;
     int ilsAttempts = 15;
     int ilsThreads = -1;
@@ -147,40 +145,29 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ========== КОРРЕКТИРОВКА КОЛИЧЕСТВА ПОТОКОВ ==========
-    // Пользователь передаёт общее количество потоков (мастер + воркеры).
-    // Вычитаем 1, чтобы получить число воркеров.
-    int originalThreads = numThreads; // для вывода предупреждений
+    // Корректировка количества потоков
+    int originalThreads = numThreads;
     if (numThreads > 1) {
-        numThreads--;   // теперь numThreads = количество воркеров
+        numThreads--;
     } else if (numThreads == 1) {
-        // Если всего 1 поток, то воркеров будет 0 – недопустимо.
-        // Устанавливаем 1 воркера, но предупреждаем.
         cerr << "Warning: --threads=1 would give 0 worker threads. Using 1 worker thread (parallel code will run effectively sequential)." << endl;
         numThreads = 1;
     }
     if (numThreads < 1) numThreads = 1;
 
-    // Корректировка ilsThreads (если задан явно)
     if (ilsThreads > 1) {
-        ilsThreads--;   // вычитаем мастер-поток ILS
+        ilsThreads--;
     } else if (ilsThreads == 1) {
         cerr << "Warning: --ils-threads=1 would give 0 worker threads for ILS. Using 1 worker thread." << endl;
-        // ilsThreads остаётся 1 (или можно 1)
     } else if (ilsThreads == 0) {
-        // Не бывает, но на всякий случай
         ilsThreads = 1;
     }
-
-    // Если ilsThreads == -1 (не задан), то позже actualIlsThreads = numThreads (уже скорректирован)
-    // =====================================================
 
     if (enableLogging) {
         Logger::instance().setEnabled(true);
         cout << "Logging enabled, output to mcs_log.txt" << endl;
     }
 
-    // Определяем режим
     bool useParallel = false;
     if (mode == "mcs") {
         useILS = false;
@@ -201,7 +188,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Вывод информации о количестве воркеров
     if (useParallel) {
         cout << "Parallel MCS will use " << numThreads << " worker thread(s) (total threads = " << (numThreads + 1) << ")" << endl;
     }
@@ -215,7 +201,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Сбор списка файлов
     vector<pair<string, string>> tasks;
     if (!singleFile.empty()) {
         size_t slash = singleFile.find_last_of("/\\");
@@ -254,9 +239,8 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Оценка плотности графа
         double density = (2.0 * m) / (static_cast<double>(n) * (n - 1));
-        bool useSparse = (density < 0.0000001) || (n > 2000);
+        bool useSparse = (density < 0.00001) || (n > 2000);
         if (useSparse) {
             cout << "[sparse representation, density=" << density << "] " << flush;
             LOG("Selected sparse representation for " + name + ", density=" + to_string(density));
@@ -300,7 +284,6 @@ int main(int argc, char* argv[]) {
                         if (adjMatrix[u][v]) adjArray[u].push_back(v);
                 }
             }
-            // Определяем количество воркеров для ILS
             int actualIlsThreads = (ilsThreads > 0) ? ilsThreads : numThreads;
             size_t bestSize = 0;
             cout << "ILS start (" << ilsAttempts << " attempts) " << flush;
@@ -321,11 +304,11 @@ int main(int argc, char* argv[]) {
         }
 
         // Основной алгоритм
+        size_t bestKnownSize = 0; // для хранения размера из GetBestSize(), если клика не получена
         if (!checkGlobalTimeout()) {
             double remainingTimeout = (timeoutSec > 0) ? max(0.0, (double)timeoutSec - ilsTotalTime) : 0.0;
 
             if (!useParallel) {
-                // Последовательная версия
                 if (useSparse) {
                     SparseMCS algo(adjArray);
                     algo.SetQuiet(true);
@@ -337,6 +320,7 @@ int main(int argc, char* argv[]) {
                     timedOut = algo.IsTimedOut();
                     if (!cliques.back().empty())
                         clique.assign(cliques.back().begin(), cliques.back().end());
+                    bestKnownSize = algo.GetBestSize();
                 } else {
                     MCS algo(adjMatrix);
                     algo.SetQuiet(true);
@@ -348,9 +332,9 @@ int main(int argc, char* argv[]) {
                     timedOut = algo.IsTimedOut();
                     if (!cliques.back().empty())
                         clique.assign(cliques.back().begin(), cliques.back().end());
+                    bestKnownSize = algo.GetBestSize();
                 }
             } else {
-                // Параллельная версия
                 if (useSparse) {
                     SparseParallelMCS algo(adjArray, queueCapacity, splitDepth,
                                            targetQueueSize, lowThreshold,
@@ -365,6 +349,7 @@ int main(int argc, char* argv[]) {
                     timedOut = algo.IsTimedOut();
                     if (!cliques.back().empty())
                         clique.assign(cliques.back().begin(), cliques.back().end());
+                    bestKnownSize = algo.GetBestSize();
                 } else {
                     ParallelMCS algo(adjMatrix, queueCapacity, splitDepth,
                                      targetQueueSize, lowThreshold,
@@ -379,6 +364,7 @@ int main(int argc, char* argv[]) {
                     timedOut = algo.IsTimedOut();
                     if (!cliques.back().empty())
                         clique.assign(cliques.back().begin(), cliques.back().end());
+                    bestKnownSize = algo.GetBestSize();
                 }
             }
 
@@ -399,16 +385,21 @@ int main(int argc, char* argv[]) {
         string modeStr = useILS ? (mode == "mcs" ? "mcs_ils" : "mcs_par_ils") : mode;
         if (useSparse) modeStr += "_sparse";
 
+        // Определяем размер для вывода: либо из найденной клики, либо из bestKnownSize
+        size_t displaySize = 0;
+        if (!clique.empty()) displaySize = clique.size();
+        else if (bestKnownSize > 0) displaySize = bestKnownSize;
+
         cout << "\r[" << taskIdx+1 << "/" << total << "] " << name
              << " | " << modeStr
-             << " | size=" << (clique.empty() ? "?" : to_string(clique.size()))
+             << " | size=" << (displaySize ? to_string(displaySize) : "?")
              << " | time=" << fixed << setprecision(2) << totalTime << "s"
              << (useILS ? (" | ils_time=" + to_string(ilsTotalTime) + "s") : "")
              << " | " << (timedOut ? "TIMEOUT" : "OK") << endl;
 
         out << name << " | " << modeStr << " | ";
-        if (clique.empty()) out << "?";
-        else out << clique.size();
+        if (displaySize) out << displaySize;
+        else out << "?";
         out << " | " << fixed << setprecision(5) << totalTime << "s"
             << " | " << fixed << setprecision(2) << ilsTotalTime << "s"
             << " | " << (timedOut ? "TIMEOUT" : "OK") << " | ";

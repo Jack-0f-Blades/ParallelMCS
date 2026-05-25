@@ -24,10 +24,18 @@ MCQ::MCQ(vector<vector<char>> const &vAdjacencyMatrix)
 
 void MCQ::InitializeOrder(vector<int> &P, vector<int> &vVertexOrder, vector<int> &vColors)
 {
-    size_t dummyCliqueSize = 0;
-    InitialOrderingMCR(m_AdjacencyMatrix, P, vColors, dummyCliqueSize, &m_bTimedOut);
-    m_uMaximumCliqueSize = dummyCliqueSize;
+    size_t foundCliqueSize = 0;
+    vector<int> initialCliqueVertices; // временный вектор
+    // Передаём его в функцию
+    OrderingTools::InitialOrderingMCR(m_AdjacencyMatrix, P, vColors, foundCliqueSize, initialCliqueVertices, &m_bTimedOut);
+    m_uMaximumCliqueSize = foundCliqueSize;
     vVertexOrder = P;
+
+    // Сохраняем клику в базовом классе
+    if (foundCliqueSize > 0 && !initialCliqueVertices.empty()) {
+        m_initialClique = initialCliqueVertices;
+        // Также можно обновить R, но не обязательно
+    }
 }
 
 void MCQ::Color(vector<int> const &vVertexOrder, vector<int> &vVerticesToReorder, vector<int> &vColors)
@@ -58,4 +66,5 @@ void MCQ::ProcessOrderAfterRecursionLocal(vector<int> &vVertexOrder, vector<int>
 void MCQ::ProcessOrderBeforeReturnLocal(vector<int> &vVertexOrder, vector<int> &P,
                                         vector<int> &vColors, vector<int> &R_local)
 {
+    // Ничего не делаем в MCQ
 }

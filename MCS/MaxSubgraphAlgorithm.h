@@ -1,7 +1,3 @@
-/*Базовый класс для всех алгоритмов ветвей и границ (MCQ, MCS, ParallelMCS). 
-Содержит общую логику рекурсивного обхода (RunRecursive), управление стеком (stackP, stackColors, stackOrder), 
-тайм-ауты, счётчики узлов.*/
-
 #ifndef MAX_SUBGRAPH_ALGORITHM_H
 #define MAX_SUBGRAPH_ALGORITHM_H
 
@@ -79,8 +75,13 @@ public:
         std::function<void(size_t nodes, size_t cliqueSize, double seconds)>;
     void SetProgressCallback(ProgressCallback cb);
 
-    // Для получения статистики (переопределяется в MCQ)
     virtual size_t getRepairCount() const { return 0; }
+
+    // Возвращает начальную клику, найденную в InitializeOrder (или пустую)
+    const std::vector<int>& GetInitialClique() const { return m_initialClique; }
+
+    // Возвращает текущий лучший размер клики (атомарно)
+    size_t GetBestSize() const { return m_uMaximumCliqueSize.load(std::memory_order_acquire); }
 
 protected:
     std::vector<int> R;
@@ -90,7 +91,7 @@ protected:
 
     double m_TimeOutSeconds = 0;
     std::chrono::steady_clock::time_point m_StartTimePoint;
-    std::chrono::steady_clock::time_point m_LastLogTime;   // для периодического лога
+    std::chrono::steady_clock::time_point m_LastLogTime;
     std::atomic<bool> m_bTimedOut;
 
     bool m_parallelMode;
@@ -107,6 +108,9 @@ protected:
     int depth;
 
     ProgressCallback m_progressCallback;
+
+    // Начальная клика (из MCR или ILS)
+    std::vector<int> m_initialClique;
 
     void RunRecursive(std::vector<int> &P,
                       std::vector<int> &vVertexOrder,

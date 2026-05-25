@@ -1,6 +1,7 @@
 #include "StaticOrderMCS.h"
 #include "OrderingTools.h"
-#include <algorithm>   // для std::find
+#include <algorithm>
+#include <iostream> 
 
 using namespace std;
 
@@ -12,10 +13,18 @@ StaticOrderMCS::StaticOrderMCS(vector<vector<char>> const &vAdjacencyMatrix)
 
 void StaticOrderMCS::InitializeOrder(vector<int> &P, vector<int> &vVertexOrder, vector<int> &vColors)
 {
-    size_t dummyCliqueSize = 0;
-    InitialOrderingMCR(m_AdjacencyMatrix, P, vColors, dummyCliqueSize);
-    m_uMaximumCliqueSize = dummyCliqueSize;
+    size_t foundCliqueSize = 0;
+    vector<int> initialCliqueVertices;
+    OrderingTools::InitialOrderingMCR(m_AdjacencyMatrix, P, vColors, foundCliqueSize, initialCliqueVertices);
+    m_uMaximumCliqueSize = foundCliqueSize;
     vVertexOrder = P;
+
+    if (foundCliqueSize > 0 && !initialCliqueVertices.empty()) {
+        m_initialClique = initialCliqueVertices;
+        std::cout << "DEBUG: MCR found clique of size " << foundCliqueSize << std::endl;
+    } else {
+        std::cout << "DEBUG: MCR did NOT return clique vertices, size=" << foundCliqueSize << std::endl;
+    }
 }
 
 void StaticOrderMCS::GetNewOrderLocal(vector<int> &vNewVertexOrder, vector<int> &vVertexOrder,
@@ -31,7 +40,6 @@ void StaticOrderMCS::GetNewOrderLocal(vector<int> &vNewVertexOrder, vector<int> 
     }
 }
 
-// ИСПРАВЛЕНО: добавлено удаление chosenVertex из vVertexOrder
 void StaticOrderMCS::ProcessOrderAfterRecursionLocal(vector<int> &vVertexOrder,
                                                      vector<int> &P,
                                                      vector<int> &vColors,
@@ -43,4 +51,4 @@ void StaticOrderMCS::ProcessOrderAfterRecursionLocal(vector<int> &vVertexOrder,
     if (it != vVertexOrder.end())
         vVertexOrder.erase(it);
     R_local.pop_back();
-}
+}   

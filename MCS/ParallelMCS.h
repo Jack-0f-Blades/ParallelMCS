@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <vector>
+#include <mutex>
 
 class ParallelMCS : public MCS
 {
@@ -26,6 +27,9 @@ public:
     void RunFromTask(const Task& t,
                      std::list<std::list<int>>& cliques) override;
 
+    // Получить лучшую найденную клику (для внешнего использования)
+    std::vector<int> GetBestClique() const;
+
 protected:
     void RunRecursiveParallel(std::vector<int> &P,
                               std::vector<int> &vVertexOrder,
@@ -37,6 +41,9 @@ protected:
 
     bool checkTimeout();
 
+    // Обновить лучшую клику (с мьютексом)
+    void updateBestClique(const std::vector<int>& clique);
+
 private:
     TaskQueue m_taskQueue;
     size_t m_queueCapacity;
@@ -47,6 +54,10 @@ private:
     int    m_minTaskSize;
 
     std::chrono::steady_clock::time_point m_lastLogTime;
+
+    // Лучшая найденная клика (для случая, когда рекурсия не запускалась)
+    mutable std::mutex m_bestCliqueMutex;
+    std::vector<int> m_bestClique;
 
     // Thread‑local стеки для переиспользования памяти внутри каждого потока
     static thread_local std::vector<std::vector<int>> t_stackP;
